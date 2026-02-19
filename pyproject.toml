@@ -1,0 +1,13 @@
+[project]
+name = "thesis-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gpiozero>=2.0.1",
+    "opencv-python>=4.13.0.92",
+    "pyserial>=3.5",
+    "pyside6>=6.10.2",
+    "ultralytics>=8.4.14",
+]
