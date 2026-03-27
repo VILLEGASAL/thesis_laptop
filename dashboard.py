@@ -5,22 +5,46 @@ import serial
 import threading
 import platform
 import os
-
-# Laptop Mode Hardware Abstraction
-if platform.system() != "Linux" or "aarch64" not in platform.machine():
-    os.environ['GPIOZERO_PIN_FACTORY'] = 'mock'
-    print("LAPTOP MODE: Using Mock GPIO Pins")
-
-from gpiozero import DigitalOutputDevice
+import ssl
+import paho.mqtt.client as mqtt
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QLabel, 
-                             QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QGridLayout)
+                               QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QGridLayout)
 from PySide6.QtCore import Qt, QThread, Slot, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap, QFont
 from detector import VideoReader, TrafficDetector 
 
-# GPIO SETUP (Mocked)
-A_GREEN, A_YELLOW, A_RED = DigitalOutputDevice(17), DigitalOutputDevice(27), DigitalOutputDevice(22)
-B_GREEN, B_YELLOW, B_RED = DigitalOutputDevice(5), DigitalOutputDevice(6), DigitalOutputDevice(13)
+# --- MQTT CONFIGURATION ---
+MQTT_BROKER = "234f69c003d543be8297e4a25e38db6b.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_USER = "al_randolph_villegas"
+MQTT_PASS = "123456789aA"
+TOPIC_CONTROL = "traffic/hardware/control"
+
+class MqttController:
+    """Handles secure communication with HiveMQ Cloud"""
+    def __init__(self):
+        # Use Version 2 of the Callback API to avoid deprecation warnings
+        self.client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+        self.client.username_pw_set(MQTT_USER, MQTT_PASS)
+        
+        # Enable TLS for Port 8883
+        self.client.tls_set(tls_version=ssl.PROTOCOL_TLS_CLIENT)
+        
+        try:
+            self.client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            self.client.loop_start()
+            print("MQTT: Connected to HiveMQ Cloud")
+        except Exception as e:
+            print(f"MQTT Connection Error: {e}")
+
+    def send_hardware_state(self, bit_string, duration):
+        """Sends 'ABC,duration' (e.g., '001,3')"""
+        payload = f"{bit_string},{duration}"
+        self.client.publish(TOPIC_CONTROL, payload)
+        print(f"MQTT SENT -> State: {bit_string} | Duration: {duration}s")
+
+# Global MQTT instance
+mqtt_hardware = MqttController()
 
 class SerialThread(QThread):
     siren_signal = Signal()
@@ -40,29 +64,33 @@ class Worker(QThread):
     def __init__(self, detector):
         super().__init__()
         self.detector = detector
-        # CHANGE: Camera 0 for Street A, Camera 1 for Street B
-        self.cam_a = VideoReader(2).start()
-        self.cam_b = VideoReader(0).start() 
+        self.cam_a = VideoReader(0).start()
+        self.cam_b = VideoReader(1).start() 
         self.start_time = time.time()
         self.current_duration = 5 
         self.last_valid_count = 0
+        self.last_sent_bits = "" # Track state to prevent duplicate MQTT messages
 
     def update_hardware(self):
-        try:
-            A_GREEN.off(); A_YELLOW.off(); A_RED.off()
-            B_GREEN.off(); B_YELLOW.off(); B_RED.off()
-            if self.detector.emergency_mode:
-                A_RED.on(); B_RED.on()
-                return
-            if self.detector.active_street == "Street A":
-                B_RED.on()
-                if self.detector.light_color == "GREEN": A_GREEN.on()
-                elif self.detector.light_color == "YELLOW": A_YELLOW.on()
-            else:
-                A_RED.on()
-                if self.detector.light_color == "GREEN": B_GREEN.on()
-                elif self.detector.light_color == "YELLOW": B_YELLOW.on()
-        except: pass
+        """Maps Traffic Logic to the 3-bit Binary Input for the Logic Circuit"""
+        # Default State: 010 (Emergency / Detecting / All Red)
+        bit_string = "010"
+        
+        if self.detector.emergency_mode:
+            bit_string = "010"
+        elif self.detector.light_color == "DETECTING":
+            bit_string = "010"
+        elif self.detector.active_street == "Street A":
+            if self.detector.light_color == "GREEN": bit_string = "000"
+            elif self.detector.light_color == "YELLOW": bit_string = "001"
+        elif self.detector.active_street == "Street B":
+            if self.detector.light_color == "GREEN": bit_string = "011"
+            elif self.detector.light_color == "YELLOW": bit_string = "100"
+
+        # Only send via MQTT if the binary state has changed
+        if bit_string != self.last_sent_bits:
+            mqtt_hardware.send_hardware_state(bit_string, int(self.current_duration))
+            self.last_sent_bits = bit_string
 
     def run(self):
         while self.detector.running:
@@ -95,41 +123,64 @@ class Worker(QThread):
         if self.detector.is_counting:
             duration = self.detector.get_duration(self.last_valid_count)
             if duration > 0:
-                self.start_time = time.time(); self.detector.is_counting = False
-                self.detector.light_color = "GREEN"; self.current_duration = duration
+                self.start_time = time.time()
+                self.detector.is_counting = False
+                self.detector.light_color = "GREEN"
+                self.current_duration = duration
             else: self.swap_lanes()
         elif self.detector.light_color == "GREEN":
-            self.start_time = time.time(); self.detector.light_color = "YELLOW"; self.current_duration = 3
+            self.start_time = time.time()
+            self.detector.light_color = "YELLOW"
+            self.current_duration = 3
         else: self.swap_lanes()
 
     def swap_lanes(self):
-        self.start_time = time.time(); self.detector.is_counting = True
-        self.detector.light_color = "DETECTING"; self.current_duration = 5 
+        self.start_time = time.time()
+        self.detector.is_counting = True
+        self.detector.light_color = "DETECTING"
+        self.current_duration = 5 
         self.last_valid_count = 0
         self.detector.active_street = "Street B" if self.detector.active_street == "Street A" else "Street A"
 
 class Dashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Traffic Monitor - Dual Camera Laptop Test")
+        self.setWindowTitle("Traffic Monitor - ESP32 MQTT Control")
         self.resize(1280, 720)
-        self.setStyleSheet("QMainWindow { background-color: #050505; } QLabel { color: #ffffff; font-family: 'Courier New'; } QFrame#Card { background-color: #1a1a1a; border: 2px solid #333; border-radius: 10px; }")
-        central = QWidget(); self.setCentralWidget(central); main_lay = QVBoxLayout(central)
+        self.setStyleSheet("""
+            QMainWindow { background-color: #050505; } 
+            QLabel { color: #ffffff; font-family: 'Courier New'; } 
+            QFrame#Card { background-color: #1a1a1a; border: 2px solid #333; border-radius: 10px; }
+        """)
+        
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_lay = QVBoxLayout(central)
         
         self.title_label = QLabel("CCTV TRAFFIC MONITORING STATION")
         self.title_label.setFont(QFont("Courier New", 20, QFont.Bold))
-        header = QHBoxLayout(); header.addWidget(self.title_label); header.addStretch()
-        exit_btn = QPushButton("EXIT"); exit_btn.setStyleSheet("background: #d32f2f; color: white; border-radius: 5px; padding: 10px; font-weight: bold;")
-        exit_btn.clicked.connect(self.close); header.addWidget(exit_btn); main_lay.addLayout(header)
+        header = QHBoxLayout()
+        header.addWidget(self.title_label)
+        header.addStretch()
+        
+        exit_btn = QPushButton("EXIT")
+        exit_btn.setStyleSheet("background: #d32f2f; color: white; border-radius: 5px; padding: 10px; font-weight: bold;")
+        exit_btn.clicked.connect(self.close)
+        header.addWidget(exit_btn)
+        main_lay.addLayout(header)
 
-        grid = QGridLayout(); grid.setSpacing(40)
+        grid = QGridLayout()
+        grid.setSpacing(40)
         self.view_a = self.create_cam_card("STREET A")
         self.view_b = self.create_cam_card("STREET B")
-        grid.addWidget(self.view_a['card'], 0, 0, alignment=Qt.AlignCenter); grid.addWidget(self.view_b['card'], 0, 1, alignment=Qt.AlignCenter); main_lay.addLayout(grid)
+        grid.addWidget(self.view_a['card'], 0, 0, alignment=Qt.AlignCenter)
+        grid.addWidget(self.view_b['card'], 0, 1, alignment=Qt.AlignCenter)
+        main_lay.addLayout(grid)
         
         self.detector = TrafficDetector()
         self.detector.frame_ready.connect(self.update_ui)
-        self.worker = Worker(self.detector); self.worker.start()
+        self.worker = Worker(self.detector)
+        self.worker.start()
 
         self.last_siren_time = 0
         self.watchdog_timer = QTimer()
@@ -141,13 +192,40 @@ class Dashboard(QMainWindow):
         self.serial_thread.start()
 
     def create_cam_card(self, title):
-        card = QFrame(); card.setObjectName("Card"); l = QVBoxLayout(card); l.setContentsMargins(15, 15, 15, 15)
-        tit = QLabel(title); tit.setAlignment(Qt.AlignCenter); tit.setFont(QFont("Courier New", 24, QFont.Bold))
-        v = QLabel(); v.setFixedSize(640, 480); v.setStyleSheet("background: black; border: 1px solid #555;")
-        info = QHBoxLayout(); c_lbl = QLabel("DETECTED: 0"); c_lbl.setFont(QFont("Courier New", 18, QFont.Bold)); c_lbl.setStyleSheet("color: #2979ff;")
-        t_lbl = QLabel("00"); t_lbl.setAlignment(Qt.AlignCenter); t_lbl.setFont(QFont("Courier New", 50, QFont.Bold)); info.addWidget(c_lbl); info.addStretch(); info.addWidget(t_lbl)
-        s_lbl = QLabel("STATUS: STANDBY"); s_lbl.setAlignment(Qt.AlignCenter); s_lbl.setFont(QFont("Courier New", 20, QFont.Bold))
-        l.addWidget(tit); l.addWidget(v); l.addLayout(info); l.addWidget(s_lbl)
+        card = QFrame()
+        card.setObjectName("Card")
+        l = QVBoxLayout(card)
+        l.setContentsMargins(15, 15, 15, 15)
+        
+        tit = QLabel(title)
+        tit.setAlignment(Qt.AlignCenter)
+        tit.setFont(QFont("Courier New", 24, QFont.Bold))
+        
+        v = QLabel()
+        v.setFixedSize(640, 480)
+        v.setStyleSheet("background: black; border: 1px solid #555;")
+        
+        info = QHBoxLayout()
+        c_lbl = QLabel("DETECTED: 0")
+        c_lbl.setFont(QFont("Courier New", 18, QFont.Bold))
+        c_lbl.setStyleSheet("color: #2979ff;")
+        
+        t_lbl = QLabel("00")
+        t_lbl.setAlignment(Qt.AlignCenter)
+        t_lbl.setFont(QFont("Courier New", 50, QFont.Bold))
+        
+        info.addWidget(c_lbl)
+        info.addStretch()
+        info.addWidget(t_lbl)
+        
+        s_lbl = QLabel("STATUS: STANDBY")
+        s_lbl.setAlignment(Qt.AlignCenter)
+        s_lbl.setFont(QFont("Courier New", 20, QFont.Bold))
+        
+        l.addWidget(tit)
+        l.addWidget(v)
+        l.addLayout(info)
+        l.addWidget(s_lbl)
         return {'card': card, 'video': v, 'timer': t_lbl, 'status': s_lbl, 'count': c_lbl}
 
     @Slot()
@@ -176,29 +254,37 @@ class Dashboard(QMainWindow):
             rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
             q_img = QImage(rgb.data, 640, 480, 640 * 3, QImage.Format_RGB888)
             pix = QPixmap.fromImage(q_img).copy()
+            
             v = self.view_a if street == "Street A" else self.view_b
             v['video'].setPixmap(pix)
+            
             if is_emergency:
-                v['status'].setText("!!! EMERGENCY !!!"); v['status'].setStyleSheet("color: #ff1744;")
-                v['timer'].setText("--"); v['count'].setText("DETECTED: --")
+                v['status'].setText("!!! EMERGENCY !!!")
+                v['status'].setStyleSheet("color: #ff1744;")
+                v['timer'].setText("--")
+                v['count'].setText("DETECTED: --")
             elif street == self.detector.active_street:
-                v['timer'].setText(f"{time_left:02d}"); v['count'].setText(f"DETECTED: {count}")
+                v['timer'].setText(f"{time_left:02d}")
+                v['count'].setText(f"DETECTED: {count}")
                 color = "#00ff41" if status == "GREEN" else "#ffea00" if status == "YELLOW" else "#ff1744"
-                v['status'].setText(f"STATUS: {status}"); v['status'].setStyleSheet(f"color: {color};"); v['timer'].setStyleSheet(f"color: {color};")
+                v['status'].setText(f"STATUS: {status}")
+                v['status'].setStyleSheet(f"color: {color};")
+                v['timer'].setStyleSheet(f"color: {color};")
+                
                 other = self.view_b if street == "Street A" else self.view_a
-                other['status'].setText("STATUS: RED"); other['status'].setStyleSheet("color: #ff1744;"); other['timer'].setText("--")
+                other['status'].setText("STATUS: RED")
+                other['status'].setStyleSheet("color: #ff1744;")
+                other['timer'].setText("--")
         except: pass
-
-    def close_hardware(self):
-        for device in [A_GREEN, A_YELLOW, A_RED, B_GREEN, B_YELLOW, B_RED]:
-            device.close()
 
     def closeEvent(self, event):
         self.detector.running = False
-        self.worker.quit(); self.worker.wait()
-        self.close_hardware()
+        self.worker.quit()
+        self.worker.wait()
         event.accept()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = Dashboard(); window.show(); sys.exit(app.exec())
+    window = Dashboard()
+    window.show()
+    sys.exit(app.exec())
